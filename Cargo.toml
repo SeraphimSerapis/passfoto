@@ -1,0 +1,19 @@
+[package]
+name = "passfoto"
+version = "0.1.0"
+edition = "2021"
+description = "Ephemeral-token webcam API for agents on macOS"
+license = "MIT"
+authors = ["Tim Messerschmidt"]
+repository = "https://github.com/SeraphimSerapis/passfoto"
+keywords = ["webcam", "camera", "agents", "cli", "macos"]
+categories = ["command-line-utilities", "multimedia"]
+
+[dependencies]
+tiny_http = "0.12"
+nokhwa = { version = "0.10", features = ["input-avfoundation"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[profile.release]
+strip = true
+lto = true
