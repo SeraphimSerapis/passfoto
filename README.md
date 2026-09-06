@@ -47,6 +47,8 @@ passfoto start
 3. Open the printed `PREVIEW` URL in a browser to frame the shot — it works from
    any machine on your LAN.
 4. Give your agent the token and the base URL (see `skills/passfoto/SKILL.md`).
+   `cargo install` ships only the binary — copy the skill into your agent's
+   skills dir so it knows the API: `cp -r skills/passfoto ~/.pi/agent/skills/`
 
 Ctrl-C exits and permanently revokes the token.
 
@@ -56,7 +58,7 @@ All endpoints require `?token=<token>`; anything else returns `401`.
 
 | Endpoint | Description | Status codes |
 |---|---|---|
-| `GET /snapshot` | JPEG still from the default camera | `200`, `429` when inside the cooldown (`Retry-After` header set) |
+| `GET /snapshot` | JPEG still from the default camera | `200`, `429` when inside the cooldown (`Retry-After` header set), `503` on transient camera failure (safe to retry shortly) |
 | `GET /snapshot?token=<t>&align=1` | Skips the cooldown, for humans framing in `/preview`; does not touch the agent cooldown | `200` |
 | `GET /preview` | Minimal HTML live view, refreshes every 2 s; for humans, not agents | `200` |
 

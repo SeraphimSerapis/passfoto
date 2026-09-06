@@ -45,6 +45,8 @@ inspection of physical setups, screens, LEDs, wiring, and printed text.
 - `429` — you hit the cooldown (default 120 s between shots). Read the
   `Retry-After` header and wait that long. Do not hammer the endpoint; each
   request is logged and visible to the human.
+- `503` — transient camera failure. Wait a few seconds and retry; the instance
+  is still alive and the cooldown was not consumed.
 
 ## Notes
 

@@ -43,7 +43,7 @@ fn visible_len(line: &str) -> usize {
     let mut ch = line.chars();
     while let Some(c) = ch.next() {
         if c == '\x1b' {
-            while let Some(d) = ch.next() {
+            for d in ch.by_ref() {
                 if d == 'm' || d == '\x07' || d == '\\' {
                     break;
                 }
@@ -83,7 +83,7 @@ fn print_banner(port: u16, min_interval: u64, token: &str) {
         &format!("{DIM}  v{} · webcam access for agents{RESET}", env!("CARGO_PKG_VERSION")),
         inner,
     );
-    framed(&format!("{DIM}  localhost only · token dies when this process does{RESET}"), inner);
+    framed(&format!("{DIM}  LAN + localhost · token dies when this process does{RESET}"), inner);
     println!("{DIM}│{RESET}");
     println!("{DIM}╰{}╯{RESET}", "─".repeat(inner));
     println!();
@@ -112,7 +112,7 @@ fn now_hms() -> String {
     // ponytail: UTC wall clock, no date dep — humans watching live can do the math
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         % 86_400;
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
@@ -197,7 +197,7 @@ impl Shooter {
         println!("  {DIM}opening FaceTime camera … approve macOS permission if asked{RESET}");
         let mut cam = Camera::new(
             CameraIndex::Index(0),
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution),
         )
         .expect("no camera found");
         cam.open_stream().expect("cannot open camera stream");
@@ -205,13 +205,15 @@ impl Shooter {
         Self(cam)
     }
 
-    fn jpeg(&mut self) -> Vec<u8> {
-        let frame = self.0.frame().expect("capture failed");
-        let img = frame.decode_image::<RgbFormat>().expect("decode failed");
+    fn jpeg(&mut self) -> Result<Vec<u8>, String> {
+        let frame = self.0.frame().map_err(|e| format!("capture: {e}"))?;
+        let img = frame
+            .decode_image::<RgbFormat>()
+            .map_err(|e| format!("decode: {e}"))?;
         let mut buf = Cursor::new(Vec::new());
         img.write_to(&mut buf, ImageFormat::Jpeg)
-            .expect("jpeg encode failed");
-        buf.into_inner()
+            .map_err(|e| format!("encode: {e}"))?;
+        Ok(buf.into_inner())
     }
 }
 
@@ -240,11 +242,24 @@ fn main() {
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--port" => port = iter.next().and_then(|v| v.parse().ok()).unwrap_or(port),
-            "--min-interval" => {
-                min_interval = iter.next().and_then(|v| v.parse().ok()).unwrap_or(min_interval)
+            "--port" => match iter.next().map(|v| v.parse::<u16>()) {
+                Some(Ok(p)) => port = p,
+                _ => {
+                    eprintln!("error: --port needs a number");
+                    std::process::exit(2);
+                }
+            },
+            "--min-interval" => match iter.next().map(|v| v.parse::<u64>()) {
+                Some(Ok(s)) => min_interval = s,
+                _ => {
+                    eprintln!("error: --min-interval needs a number");
+                    std::process::exit(2);
+                }
+            },
+            other => {
+                eprintln!("unknown arg: {other}\nusage: passfoto [start] [--port N] [--min-interval SECS]");
+                std::process::exit(2);
             }
-            other => eprintln!("unknown arg: {other}"),
         }
     }
 
@@ -280,7 +295,7 @@ fn main() {
         match path.as_str() {
             "/preview" => {
                 log("PREVIEW", CYAN, "/preview", &peer, "browser session");
-                respond(request, StatusCode(200), "text/html", &preview_html());
+                respond(request, StatusCode(200), "text/html", preview_html());
             }
             "/snapshot" => {
                 // ?align= marks frames requested by the human tuning framing — skip the cooldown,
@@ -310,7 +325,20 @@ fn main() {
                     }
                 }
 
-                let jpeg = shooter.jpeg();
+                let jpeg = match shooter.jpeg() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        // transient camera failure: keep serving, cooldown untouched
+                        log("ERROR", RED, "/snapshot", &peer, &e);
+                        respond(
+                            request,
+                            StatusCode(503),
+                            "text/plain",
+                            "camera capture failed, try again\n",
+                        );
+                        continue;
+                    }
+                };
                 // align frames are the human's viewfinder — they neither consume nor
                 // reset the agent cooldown, so framing in /preview can't starve an agent
                 if !align {
@@ -327,15 +355,14 @@ fn main() {
     }
 }
 
-fn preview_html() -> String {
-    format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>passfoto · preview</title></head>\
-         <body style='margin:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:ui-monospace,Menlo,monospace'>\
-         <img id='f' style='max-width:96vw;max-height:88vh;border:1px solid #222'>\
-         <p style='color:#555;margin:12px'>passfoto live preview · refreshes every 2s</p>\
-         <script>const q=location.search;const f=document.getElementById('f');\
-         const tick=()=>{{f.src='/snapshot'+q+'&align='+Date.now()}};tick();setInterval(tick,2000);</script>\
-         </body></html>")
+fn preview_html() -> &'static str {
+    r"<!doctype html><html><head><meta charset='utf-8'><title>passfoto · preview</title></head>
+         <body style='margin:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:ui-monospace,Menlo,monospace'>
+         <img id='f' style='max-width:96vw;max-height:88vh;border:1px solid #222'>
+         <p style='color:#555;margin:12px'>passfoto live preview · refreshes every 2s</p>
+         <script>const q=location.search;const f=document.getElementById('f');
+         const tick=()=>{f.src='/snapshot'+q+'&align='+Date.now()};tick();setInterval(tick,2000);</script>
+         </body></html>"
 }
 
 fn respond(request: tiny_http::Request, status: StatusCode, content_type: &str, body: &str) {
@@ -365,6 +392,17 @@ mod tests {
         assert_eq!(query_param("/snapshot?x=1&token=abc", "token"), Some("abc"));
         assert_eq!(query_param("/snapshot", "token"), None);
         assert_eq!(query_param("/snapshot?not=abc", "token"), None);
+    }
+
+    #[test]
+    fn is_private_gates_rfc1918() {
+        assert!(is_private("192.168.1.2"));
+        assert!(is_private("10.0.0.1"));
+        assert!(is_private("172.16.0.1"));
+        assert!(is_private("172.31.255.255"));
+        assert!(!is_private("172.15.0.1"));
+        assert!(!is_private("172.32.0.1"));
+        assert!(!is_private("8.8.8.8"));
     }
 
     #[test]
