@@ -9,6 +9,7 @@ mod ui;
 use std::io;
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use tiny_http::Server;
 
@@ -20,6 +21,7 @@ use crate::ui::{BannerInfo, DIM, RESET};
 
 /// Frames discarded after the camera opens so autoexposure settles before the real shot.
 const WARMUP_FRAMES: u32 = 15;
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -76,6 +78,17 @@ fn start(cfg: Config) -> ExitCode {
         Err(e) => return fail(&format!("cannot read /dev/urandom for a token: {e}")),
     };
 
+    // Ask now, while the human is at the terminal, rather than on an agent's first capture.
+    if !camera::permission_granted() {
+        println!("waiting for camera permission: approve the macOS prompt");
+        if !camera::request_permission(PERMISSION_TIMEOUT) {
+            eprintln!(
+                "warning: camera permission not granted; snapshots return 503 until it is \
+                 enabled in System Settings > Privacy & Security > Camera"
+            );
+        }
+    }
+
     ui::print_banner(&BannerInfo {
         bind: cfg.bind,
         port: cfg.port,
@@ -85,9 +98,7 @@ fn start(cfg: Config) -> ExitCode {
         agent_token: tokens.agent.as_str(),
         preview_token: tokens.preview.as_str(),
     });
-    println!(
-        "  {DIM}camera opens on the first capture · approve macOS permission if asked{RESET}\n"
-    );
+    println!("  {DIM}camera opens on the first capture and closes when idle{RESET}\n");
 
     let camera = CameraHandle::spawn(CameraConfig {
         index: cfg.camera,
