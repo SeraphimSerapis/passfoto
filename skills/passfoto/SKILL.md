@@ -6,9 +6,9 @@ description: Take a webcam photo on the user's Mac through an authenticated HTTP
 # passfoto
 
 passfoto runs on the user's Mac and serves the webcam as a small HTTP API on
-the local network. The human starts it with `passfoto start`, and the banner
-shows the base URL (port `8741` by default) and a session token. Every request
-needs that token. The token dies when the process exits.
+the local network. The human starts it with `passfoto start`. Its banner has an
+AGENT SETUP block with the base URL and your agent token. Every request needs
+that token, and it dies when the process exits.
 
 ## When to take a photo
 
@@ -27,15 +27,31 @@ shot, then check for exactly that.
 
 ## Setup
 
-Ask the human for the base URL and token, then export them:
+Ask the human to paste the AGENT SETUP lines from the banner into your shell:
 
 ```sh
-export PASSFOTO_URL=http://192.168.1.20:8741   # from the banner
-export PASSFOTO_TOKEN=<token>                  # from the banner
+export PASSFOTO_URL=http://192.168.1.20:8741
+export PASSFOTO_TOKEN=<agent token>
 ```
 
 Never guess or brute-force the token. A wrong token gets `401`, and the human
-sees every attempt.
+sees every attempt. The banner also shows a preview token for the human's
+browser. It does not work on `/snapshot` or `/status`, so don't use it.
+
+To check that passfoto is up and how long the cooldown has left, without
+touching the camera or the cooldown:
+
+```sh
+curl -s -H "Authorization: Bearer $PASSFOTO_TOKEN" "$PASSFOTO_URL/status"
+```
+
+```json
+{"version":"0.1.1","min_interval_s":120,"cooldown_remaining_s":0,"last_shot_age_s":null,"camera":"closed","camera_error":null}
+```
+
+`camera` is one of `closed`, `opening`, `streaming`, or `failed`. `closed` is
+normal: the camera opens on the next snapshot. When it is `failed`,
+`camera_error` says why.
 
 ## Taking a photo
 
@@ -43,53 +59,67 @@ Use `scripts/snap.sh` from this skill's directory. It writes the JPEG only on
 success and maps every failure to its own exit code:
 
 ```sh
-sh <skill-dir>/scripts/snap.sh shot.jpg
+sh <skill-dir>/scripts/snap.sh shot.jpg 1024
 ```
+
+The second argument is an optional width in pixels (32 to 8192). The server
+downscales to that width and keeps the aspect ratio. It never upscales.
 
 | Exit | Meaning | What to do |
 |---|---|---|
 | `0` | `shot.jpg` written | Look at it. |
-| `2` | Missing argument, `PASSFOTO_URL`, or `PASSFOTO_TOKEN` | Fix the call or ask the human for the values. |
+| `2` | Bad arguments, missing `PASSFOTO_URL`/`PASSFOTO_TOKEN`, or the server rejected the width (`400`) | Fix the call or ask the human for the values. |
 | `3` | `401`, token wrong or expired | Ask the human for the current token. Do not retry with the same one. |
 | `4` | `429`, cooldown active | stderr ends with `retry_after=N`. Sleep `N` seconds and run it again only if you still need the photo. The script never waits on its own. |
-| `5` | `503`, camera failed for this request | Wait a few seconds and retry. The cooldown was not used up. |
+| `5` | `503` with `Retry-After`: camera busy, another app holds it, or one capture failed | stderr ends with `retry_after=N`. Sleep `N` seconds and retry. The cooldown was not used up. |
+| `7` | `503` without `Retry-After`: camera unavailable (no device, permission denied) | Tell the human what stderr says. Retry only after they fix it. |
 | `6` | passfoto not reachable | Ask the human to run `passfoto start`, or check the host and port. |
 | `1` | Anything else | Read stderr and report it to the human. |
 
-The script sends the token as `Authorization: Bearer <token>`. If you are on a
-passfoto build that rejects the header with `401` even though the token is
-right, fall back to the query string:
-
-```sh
-curl -sS -o shot.jpg "$PASSFOTO_URL/snapshot?token=$PASSFOTO_TOKEN"
-```
+The first snapshot after a quiet period takes a little longer. The camera
+closes when idle, so it has to open again and discard a few frames while the
+exposure settles.
 
 ## Saving vision tokens
 
-The camera returns its full resolution, usually around 1920x1080. Most checks
-(is the LED on, did the display update, is the wire in the right hole) work at
-1024 px wide or less. Downscale before you look:
+Without a width you get the camera's highest resolution, often 1920x1080. Most
+checks (is the LED on, did the display update, is the wire in the right hole)
+work at 1024 px wide or less, so pass a width. Keep full resolution for small
+printed text or part numbers. Each shot uses up the cooldown, so pick the
+width before you shoot instead of taking a small one and then a big one.
+
+## Direct HTTP
+
+If you can't run the script, call the API yourself. Send the token as
+`Authorization: Bearer <token>`; `?token=<token>` in the URL also works, but
+it ends up in logs and shell history.
 
 ```sh
-sips -Z 1024 shot.jpg          # macOS
-magick shot.jpg -resize 1024x shot.jpg   # ImageMagick, anywhere
+curl -sS -H "Authorization: Bearer $PASSFOTO_TOKEN" -o shot.jpg -D headers.txt \
+  "$PASSFOTO_URL/snapshot?width=1024"
 ```
 
-Keep the full image when you need to read small printed text or part numbers.
+`GET /snapshot` takes `width` (32 to 8192) and `quality` (JPEG quality 1 to
+100, default 85).
 
-## Status codes, for direct HTTP use
-
-- `200`: body is the JPEG.
-- `401`: wrong or expired token. Ask the human; the token changes every time
-  passfoto restarts.
-- `404`: wrong path. Only `/snapshot` and `/preview` exist.
-- `429`: cooldown. Wait for the number of seconds in `Retry-After`.
-- `503`: transient camera failure. Retry after a few seconds.
+- `200`: body is the JPEG. `X-Captured-At` holds the capture time in UTC, for
+  example `2026-11-12T13:06:12.345Z`.
+- `400`: bad `width` or `quality`. The body says which.
+- `401`: wrong or expired token. The token changes every time passfoto
+  restarts.
+- `404`: wrong path. The agent paths are `/snapshot` and `/status`.
+- `429`: cooldown. Wait the number of seconds in `Retry-After`.
+- `503` with `Retry-After`: busy or transient failure, retry after that many
+  seconds.
+- `503` without `Retry-After`: camera unavailable. The body says why; the
+  human has to fix it.
 - Connection refused: passfoto is not running.
 
 ## Notes
 
-- `/preview` is the human's live view for framing the shot. Don't call it, and
-  don't pass `align=1` to `/snapshot`; that parameter is for the preview page.
+- `/preview` and `/preview/frame` are the human's viewfinder and need the
+  preview token. They don't affect your cooldown.
+- `align=1` on `/snapshot` is ignored. Agent snapshots are always rate
+  limited.
 - Every request is logged in the human's terminal as `GRANT`, `DENY`,
-  `THROTTLED`, `ALIGN`, `PREVIEW`, or `ERROR`.
+  `THROTTLED`, `BAD REQ`, `ERROR`, `STATUS`, or `PREVIEW`.
