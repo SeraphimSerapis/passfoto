@@ -108,8 +108,8 @@ token is checked. Every response carries `Cache-Control: no-store`.
 | `400` | Bad `width` or `quality`; the body says which |
 | `401` | Missing or wrong token |
 | `429` | Inside the cooldown. `Retry-After: N` and the body `throttled, retry in Ns` carry the same N |
-| `503` + `Retry-After: 1` | Camera busy: another capture, including another agent snapshot, is in flight |
-| `503` + `Retry-After: 2` | Transient failure, including another app holding the camera |
+| `503` + `Retry-After: N` | Camera busy: another capture, including another agent snapshot, is in flight. Body `camera busy, retry in Ns`, N is 1 |
+| `503` + `Retry-After: N` | Transient failure, including another app holding the camera. Body `camera capture failed, retry in Ns`, N is the remaining camera backoff |
 | `503`, no `Retry-After` | Camera unavailable (no device, permission denied). The body starts with `camera unavailable:` and needs a human to fix |
 
 A `503` never uses up the cooldown. When several agent requests arrive at
@@ -135,8 +135,8 @@ capturing or within that idle window. An open preview tab keeps the camera
 and LED on, because every preview frame is a capture and resets the idle timer.
 
 If the camera fails to open, passfoto tries again on later captures, waiting
-1, 2, 4, and so on up to 30 seconds between attempts. The terminal log shows
-when the next attempt is due.
+1, 2, 4, and so on up to 30 seconds between attempts. For transient failures,
+the `Retry-After` on the `503` says when the next attempt is due.
 
 ## Security notes
 
