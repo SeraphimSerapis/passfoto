@@ -30,6 +30,8 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(250);
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Retry hint for `Busy` and for decode/encode errors, which have no backoff.
+const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 const PERMISSION_HINT: &str = "camera permission not granted; approve the macOS prompt \
      or enable it in System Settings > Privacy & Security > Camera";
@@ -63,17 +65,35 @@ pub enum CaptureError {
     /// Another capture is in flight; retry shortly.
     Busy,
     /// No device at the configured index, or camera permission denied.
-    Unavailable(String),
+    Unavailable {
+        reason: String,
+        retry_after: Duration,
+    },
     /// The device exists but this attempt failed; retrying may succeed.
-    Transient(String),
+    Transient {
+        reason: String,
+        retry_after: Duration,
+    },
+}
+
+impl CaptureError {
+    /// How long until a retry can do anything: the camera's remaining backoff
+    /// for `Unavailable` and `Transient`, a short constant for `Busy`.
+    pub fn retry_after(&self) -> Duration {
+        match self {
+            CaptureError::Busy => BUSY_RETRY,
+            CaptureError::Unavailable { retry_after, .. }
+            | CaptureError::Transient { retry_after, .. } => *retry_after,
+        }
+    }
 }
 
 impl fmt::Display for CaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CaptureError::Busy => write!(f, "camera busy with another capture"),
-            CaptureError::Unavailable(why) => write!(f, "camera unavailable: {why}"),
-            CaptureError::Transient(why) => write!(f, "camera capture failed: {why}"),
+            CaptureError::Unavailable { reason, .. } => write!(f, "camera unavailable: {reason}"),
+            CaptureError::Transient { reason, .. } => write!(f, "camera capture failed: {reason}"),
         }
     }
 }
@@ -128,6 +148,50 @@ pub fn request_permission(timeout: Duration) -> bool {
 
 // ---------- lifecycle: pure bookkeeping, no nokhwa, unit-tested ----------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultKind {
+    Unavailable,
+    Transient,
+}
+
+/// A failure before the lifecycle has decided the backoff; becomes a
+/// `CaptureError` once `retry_after` is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fault {
+    kind: FaultKind,
+    reason: String,
+}
+
+impl Fault {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FaultKind::Unavailable,
+            reason: reason.into(),
+        }
+    }
+
+    fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FaultKind::Transient,
+            reason: reason.into(),
+        }
+    }
+
+    fn into_error(self, retry_after: Duration) -> CaptureError {
+        let reason = self.reason;
+        match self.kind {
+            FaultKind::Unavailable => CaptureError::Unavailable {
+                reason,
+                retry_after,
+            },
+            FaultKind::Transient => CaptureError::Transient {
+                reason,
+                retry_after,
+            },
+        }
+    }
+}
+
 /// What the worker should do with a capture request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
@@ -144,7 +208,7 @@ struct Lifecycle {
     /// Consecutive failures since the last successful capture; drives backoff.
     failures: u32,
     retry_at: Option<Instant>,
-    last_error: Option<CaptureError>,
+    last_fault: Option<Fault>,
     last_used: Option<Instant>,
 }
 
@@ -154,7 +218,7 @@ impl Lifecycle {
             state: CameraState::Closed,
             failures: 0,
             retry_at: None,
-            last_error: None,
+            last_fault: None,
             last_used: None,
         }
     }
@@ -163,16 +227,18 @@ impl Lifecycle {
         match self.state {
             CameraState::Streaming => Step::Shoot,
             CameraState::Closed | CameraState::Opening => Step::Open,
-            CameraState::Failed { .. } => match self.retry_at.and_then(|t| t.checked_duration_since(now)) {
-                Some(wait) if !wait.is_zero() => {
-                    let err = self
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| CaptureError::Transient("camera failed".into()));
-                    Step::Reject(with_retry_note(&err, wait))
+            CameraState::Failed { .. } => {
+                match self.retry_at.and_then(|t| t.checked_duration_since(now)) {
+                    Some(wait) if !wait.is_zero() => {
+                        let fault = self
+                            .last_fault
+                            .clone()
+                            .unwrap_or_else(|| Fault::transient("camera failed"));
+                        Step::Reject(fault.into_error(wait))
+                    }
+                    _ => Step::Open,
                 }
-                _ => Step::Open,
-            },
+            }
         }
     }
 
@@ -191,17 +257,22 @@ impl Lifecycle {
         self.last_used = Some(now);
         self.failures = 0;
         self.retry_at = None;
-        self.last_error = None;
+        self.last_fault = None;
     }
 
-    fn on_failure(&mut self, err: &CaptureError, now: Instant, wall: SystemTime) {
+    /// Records the failure, starts the next backoff and returns the error for the
+    /// caller, carrying that backoff as `retry_after`.
+    fn on_failure(&mut self, fault: Fault, now: Instant, wall: SystemTime) -> CaptureError {
         self.failures = self.failures.saturating_add(1);
-        self.retry_at = Some(now + backoff(self.failures));
-        self.last_error = Some(err.clone());
+        let wait = backoff(self.failures);
+        self.retry_at = Some(now + wait);
+        let err = fault.clone().into_error(wait);
         self.state = CameraState::Failed {
             since: wall,
             reason: err.to_string(),
         };
+        self.last_fault = Some(fault);
+        err
     }
 
     fn on_closed(&mut self) {
@@ -224,19 +295,6 @@ fn backoff(failures: u32) -> Duration {
     }
     let factor = 1u32.checked_shl(failures - 1).unwrap_or(u32::MAX);
     BACKOFF_BASE.saturating_mul(factor).min(BACKOFF_MAX)
-}
-
-fn with_retry_note(err: &CaptureError, wait: Duration) -> CaptureError {
-    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
-    match err {
-        CaptureError::Busy => CaptureError::Busy,
-        CaptureError::Unavailable(why) => {
-            CaptureError::Unavailable(format!("{why} (retrying in {secs}s)"))
-        }
-        CaptureError::Transient(why) => {
-            CaptureError::Transient(format!("{why} (retrying in {secs}s)"))
-        }
-    }
 }
 
 /// Target size for downscaling to `max_width`, preserving aspect ratio. Never upscales.
@@ -343,12 +401,12 @@ impl CameraHandle {
             let mut slot = lock(&self.inner.slot);
             if slot.worker.is_none() {
                 let worker = Worker::spawn(&self.inner.cfg, slot.carry.clone())
-                    .map_err(|e| CaptureError::Transient(format!("spawn camera thread: {e}")))?;
+                    .map_err(|e| retry_soon(format!("spawn camera thread: {e}")))?;
                 slot.worker = Some(worker);
             }
             match &slot.worker {
                 Some(w) => w.requests.clone(),
-                None => return Err(CaptureError::Transient("camera thread missing".into())),
+                None => return Err(retry_soon("camera thread missing")),
             }
         };
         let (reply, response) = mpsc::channel();
@@ -373,14 +431,18 @@ impl CameraHandle {
     /// exit as soon as nokhwa returns. If the device never delivers another frame,
     /// that thread stays parked, which is the price of nokhwa's blocking API.
     fn abandon_worker(&self, why: String) -> CaptureError {
-        let err = CaptureError::Transient(why);
         let mut slot = lock(&self.inner.slot);
         if let Some(w) = slot.worker.take() {
             slot.carry = lock(&w.published).clone();
         }
-        slot.carry.on_failure(&err, Instant::now(), SystemTime::now());
-        err
+        slot.carry
+            .on_failure(Fault::transient(why), Instant::now(), SystemTime::now())
     }
+}
+
+/// A transient error outside the lifecycle (thread spawn, decode, encode), so no backoff.
+fn retry_soon(reason: impl Into<String>) -> CaptureError {
+    Fault::transient(reason).into_error(BUSY_RETRY)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -419,7 +481,7 @@ fn run_worker(
                 if let Some(c) = cam.as_mut() {
                     if let Err(e) = grab(c) {
                         close(&mut cam);
-                        lc.on_failure(&e, Instant::now(), SystemTime::now());
+                        lc.on_failure(e, Instant::now(), SystemTime::now());
                         *lock(&published) = lc.clone();
                     }
                 }
@@ -449,48 +511,46 @@ fn serve(
                     *cam = Some(c);
                     lc.on_opened(Instant::now());
                 }
-                Err(e) => {
-                    lc.on_failure(&e, Instant::now(), SystemTime::now());
-                    return Err(e);
+                Err(fault) => {
+                    return Err(lc.on_failure(fault, Instant::now(), SystemTime::now()));
                 }
             }
         }
     }
     let result = match cam.as_mut() {
         Some(c) => fresh_frame(c),
-        None => Err(CaptureError::Transient("camera not open".into())),
+        None => Err(Fault::transient("camera not open")),
     };
     match result {
         Ok(shot) => {
             lc.on_shot(Instant::now());
             Ok(shot)
         }
-        Err(e) => {
+        Err(fault) => {
             close(cam);
-            lc.on_failure(&e, Instant::now(), SystemTime::now());
-            Err(e)
+            Err(lc.on_failure(fault, Instant::now(), SystemTime::now()))
         }
     }
 }
 
 /// Runs a nokhwa call, turning both its errors and its panics into `Transient`.
-fn guarded<T>(what: &str, f: impl FnOnce() -> Result<T, NokhwaError>) -> Result<T, CaptureError> {
+fn guarded<T>(what: &str, f: impl FnOnce() -> Result<T, NokhwaError>) -> Result<T, Fault> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(CaptureError::Transient(format!("{what}: {e}"))),
-        Err(_) => Err(CaptureError::Transient(format!("{what}: camera driver panicked"))),
+        Ok(Err(e)) => Err(Fault::transient(format!("{what}: {e}"))),
+        Err(_) => Err(Fault::transient(format!("{what}: camera driver panicked"))),
     }
 }
 
-fn open_warm(cfg: &CameraConfig) -> Result<Camera, CaptureError> {
+fn open_warm(cfg: &CameraConfig) -> Result<Camera, Fault> {
     if !nokhwa::nokhwa_check() {
         // Shows the prompt if the user has not decided yet; a no-op once denied.
         nokhwa::nokhwa_initialize(|_| {});
-        return Err(CaptureError::Unavailable(PERMISSION_HINT.into()));
+        return Err(Fault::unavailable(PERMISSION_HINT));
     }
-    let found = list_cameras().map_err(CaptureError::Transient)?;
+    let found = list_cameras().map_err(Fault::transient)?;
     if !found.iter().any(|c| c.index == cfg.index) {
-        return Err(CaptureError::Unavailable(format!(
+        return Err(Fault::unavailable(format!(
             "no camera at index {} ({} found)",
             cfg.index,
             found.len()
@@ -516,23 +576,25 @@ fn open_warm(cfg: &CameraConfig) -> Result<Camera, CaptureError> {
 
 /// AVFoundation refuses `lockForConfiguration` while another process holds the
 /// device, and nokhwa surfaces that as an opaque property error.
-fn explain_lock(err: CaptureError) -> CaptureError {
-    match err {
-        CaptureError::Transient(why) if why.contains("lockForConfiguration") => {
-            CaptureError::Transient(format!("camera is in use by another app ({why})"))
-        }
-        other => other,
+fn explain_lock(fault: Fault) -> Fault {
+    if fault.reason.contains("lockForConfiguration") {
+        Fault::transient(format!(
+            "camera is in use by another app ({})",
+            fault.reason
+        ))
+    } else {
+        fault
     }
 }
 
 /// Pulls one frame and throws it away; also drains whatever else is queued.
-fn grab(cam: &mut Camera) -> Result<(), CaptureError> {
+fn grab(cam: &mut Camera) -> Result<(), Fault> {
     guarded("read frame", || cam.frame()).map(drop)
 }
 
 /// The first `frame()` returns the oldest queued frame and drains the rest, so
 /// the second one is the next frame the sensor delivers.
-fn fresh_frame(cam: &mut Camera) -> Result<Shot, CaptureError> {
+fn fresh_frame(cam: &mut Camera) -> Result<Shot, Fault> {
     grab(cam)?;
     let buffer = guarded("read frame", || cam.frame())?;
     Ok(Shot {
@@ -556,7 +618,7 @@ fn encode(shot: &Shot, opts: CaptureOpts) -> Result<Frame, CaptureError> {
     let mut img = shot
         .buffer
         .decode_image::<RgbFormat>()
-        .map_err(|e| CaptureError::Transient(format!("decode: {e}")))?;
+        .map_err(|e| retry_soon(format!("decode: {e}")))?;
     let (w, h) = fit_width(img.width(), img.height(), opts.max_width);
     if w != img.width() {
         img = image::imageops::resize(&img, w, h, FilterType::Triangle);
@@ -564,7 +626,7 @@ fn encode(shot: &Shot, opts: CaptureOpts) -> Result<Frame, CaptureError> {
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, opts.quality.clamp(1, 100))
         .encode_image(&img)
-        .map_err(|e| CaptureError::Transient(format!("encode: {e}")))?;
+        .map_err(|e| retry_soon(format!("encode: {e}")))?;
     Ok(Frame {
         jpeg,
         width: w,
@@ -639,17 +701,25 @@ mod tests {
     }
 
     #[test]
-    fn failure_rejects_during_backoff_with_original_kind_then_retries() {
+    fn failure_returns_backoff_and_rejects_with_original_kind_until_it_expires() {
         let t0 = Instant::now();
         let mut lc = Lifecycle::new();
-        let err = CaptureError::Unavailable("no camera at index 0 (0 found)".into());
-        lc.on_failure(&err, t0, wall());
-        assert!(matches!(lc.state, CameraState::Failed { .. }));
+        let fault = Fault::unavailable("no camera at index 0 (0 found)");
+        let err = lc.on_failure(fault, t0, wall());
+        assert_eq!(
+            err,
+            CaptureError::Unavailable {
+                reason: "no camera at index 0 (0 found)".into(),
+                retry_after: Duration::from_secs(1),
+            }
+        );
+        assert!(
+            matches!(lc.state, CameraState::Failed { ref reason, .. } if reason.contains("index 0"))
+        );
         assert_eq!(lc.idle_deadline(IDLE), None);
         match lc.on_capture(t0 + Duration::from_millis(200)) {
-            Step::Reject(CaptureError::Unavailable(why)) => {
-                assert!(why.contains("index 0"), "{why}");
-                assert!(why.ends_with("(retrying in 1s)"), "{why}");
+            Step::Reject(e @ CaptureError::Unavailable { .. }) => {
+                assert_eq!(e.retry_after(), Duration::from_millis(800));
             }
             other => panic!("expected Unavailable rejection, got {other:?}"),
         }
@@ -660,38 +730,56 @@ mod tests {
     fn repeated_failures_back_off_longer_until_a_frame_arrives() {
         let t0 = Instant::now();
         let mut lc = Lifecycle::new();
-        let err = CaptureError::Transient("read frame: gone".into());
-        lc.on_failure(&err, t0, wall());
-        lc.on_failure(&err, t0, wall());
-        assert!(matches!(
-            lc.on_capture(t0 + Duration::from_millis(1500)),
-            Step::Reject(CaptureError::Transient(_))
-        ));
+        let gone = || Fault::transient("read frame: gone");
+        assert_eq!(
+            lc.on_failure(gone(), t0, wall()).retry_after(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            lc.on_failure(gone(), t0, wall()).retry_after(),
+            Duration::from_secs(2)
+        );
+        match lc.on_capture(t0 + Duration::from_millis(1500)) {
+            Step::Reject(e @ CaptureError::Transient { .. }) => {
+                assert_eq!(e.retry_after(), Duration::from_millis(500));
+            }
+            other => panic!("expected Transient rejection, got {other:?}"),
+        }
         assert_eq!(lc.on_capture(t0 + Duration::from_secs(2)), Step::Open);
 
         // A successful open alone does not forgive earlier failures.
         lc.on_opened(t0);
-        lc.on_failure(&err, t0, wall());
-        assert_eq!(lc.failures, 3);
+        assert_eq!(
+            lc.on_failure(gone(), t0, wall()).retry_after(),
+            Duration::from_secs(4)
+        );
 
         lc.on_opened(t0);
         lc.on_shot(t0);
         assert_eq!(lc.failures, 0);
-        lc.on_failure(&err, t0, wall());
+        assert_eq!(
+            lc.on_failure(gone(), t0, wall()).retry_after(),
+            Duration::from_secs(1)
+        );
         assert_eq!(lc.on_capture(t0 + Duration::from_secs(1)), Step::Open);
     }
 
     #[test]
-    fn retry_note_keeps_error_kind() {
-        let wait = Duration::from_millis(2100);
-        assert_eq!(
-            with_retry_note(&CaptureError::Transient("x".into()), wait),
-            CaptureError::Transient("x (retrying in 3s)".into())
-        );
-        assert_eq!(
-            with_retry_note(&CaptureError::Unavailable("y".into()), Duration::from_secs(2)),
-            CaptureError::Unavailable("y (retrying in 2s)".into())
-        );
+    fn busy_and_out_of_lifecycle_errors_retry_soon() {
+        assert_eq!(CaptureError::Busy.retry_after(), BUSY_RETRY);
+        assert_eq!(retry_soon("decode: bad").retry_after(), BUSY_RETRY);
+    }
+
+    #[test]
+    fn lock_rejection_is_explained_as_camera_in_use() {
+        let raw = Fault::transient("open camera: Could not set device property lockForConfiguration with value Locked: Lock Rejected");
+        let explained = explain_lock(raw);
+        assert_eq!(explained.kind, FaultKind::Transient);
+        assert!(explained
+            .reason
+            .starts_with("camera is in use by another app"));
+        let other = Fault::transient("open stream: nope");
+        assert_eq!(explain_lock(other.clone()), other);
     }
 
     #[test]
