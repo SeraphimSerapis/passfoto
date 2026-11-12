@@ -9,7 +9,7 @@ token works on `/snapshot` and `/status`; the preview token works on
 `/preview` and `/preview/frame`.
 
 Why: with one shared token, the preview's cooldown-free frames were reachable
-by the agent. Up to v0.1.1, `/snapshot?align=1` skipped the cooldown so the
+by the agent. In earlier builds, `/snapshot?align=1` skipped the cooldown so the
 preview could refresh every 2 s, and any agent holding the token could use it
 the same way. Splitting the tokens makes the cooldown a property of the agent
 token, so no request parameter can bypass it. `align` is now ignored.

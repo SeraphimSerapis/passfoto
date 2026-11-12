@@ -130,7 +130,8 @@ successful agent snapshot.
 The camera is not opened at startup. It opens on the first capture, discards a
 few frames so exposure can settle, and closes again after `--idle-timeout`
 seconds without a capture. The green camera LED is only on while passfoto is
-capturing or within that idle window.
+capturing or within that idle window. An open preview tab keeps the camera
+and LED on, because every preview frame is a capture and resets the idle timer.
 
 If the camera fails to open, passfoto tries again on later captures, waiting
 1, 2, 4, and so on up to 30 seconds between attempts. The terminal log shows
@@ -147,7 +148,7 @@ when the next attempt is due.
   give it only to your agent. Prefer the `Authorization` header over
   `?token=`, which ends up in shell history and logs.
 - The preview token is separate so the agent token has no way around the
-  cooldown. Up to v0.1.1, an agent could add `align=1` to `/snapshot` to skip
+  cooldown. Earlier builds let an agent add `align=1` to `/snapshot` to skip
   it; that parameter is now ignored. The preview token can still fetch
   960 px frames with no cooldown, so keep it as private as the agent token.
 - Both tokens are 32 hex chars from `/dev/urandom`, live only in process
