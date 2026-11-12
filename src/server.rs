@@ -9,7 +9,7 @@ use tiny_http::{Header, Request, Response, Server, StatusCode};
 use crate::api::{self, CameraSummary, SnapshotParams, PREVIEW_MAX_WIDTH, PREVIEW_QUALITY};
 use crate::auth::{presented_token, Role, Tokens};
 use crate::camera::{CameraHandle, CameraState, CaptureError, CaptureOpts, Frame};
-use crate::throttle::{ceil_secs, Throttle};
+use crate::throttle::{ceil_secs, Denied, Throttle};
 use crate::ui::{log, AMBER, CYAN, RED};
 
 /// Enough that a slow client or a capture in progress never stalls `/status` or a 401.
@@ -165,7 +165,7 @@ fn snapshot(app: &App, request: Request, url: &str, peer: &str) {
 
     let reservation = match app.throttle.try_reserve(Instant::now()) {
         Ok(r) => r,
-        Err(wait) => {
+        Err(Denied::Cooldown(wait)) => {
             let secs = ceil_secs(wait);
             log(
                 "THROTTLED",
@@ -176,6 +176,16 @@ fn snapshot(app: &App, request: Request, url: &str, peer: &str) {
             );
             let resp = text(429, &format!("throttled, retry in {secs}s\n"));
             return send(request, with_header(resp, "Retry-After", &secs.to_string()));
+        }
+        Err(Denied::Pending) => {
+            log(
+                "BUSY",
+                AMBER,
+                "/snapshot",
+                peer,
+                "another agent capture in flight",
+            );
+            return send(request, capture_failed(&CaptureError::Busy));
         }
     };
 

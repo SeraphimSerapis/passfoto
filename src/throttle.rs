@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 /// Agent cooldown shared by every server thread.
 ///
 /// A request first reserves the slot (atomically, under the lock) and only then
-/// captures. A pending reservation counts as a shot, so a concurrent agent request
-/// is refused. If the capture fails, dropping the reservation releases the slot
-/// and the cooldown is as if the request never happened.
+/// captures. While a reservation is pending every other agent request is refused,
+/// however long the capture takes. If the capture fails, dropping the reservation
+/// releases the slot and the cooldown is as if the request never happened.
 pub struct Throttle {
     min_interval: Duration,
     state: Mutex<State>,
@@ -15,17 +15,18 @@ pub struct Throttle {
 #[derive(Default)]
 struct State {
     last_shot: Option<Instant>,
-    pending: Option<(u64, Instant)>,
+    pending: Option<u64>,
     next_id: u64,
 }
 
-impl State {
-    fn busy_since(&self) -> Option<Instant> {
-        match (self.last_shot, self.pending) {
-            (Some(a), Some((_, b))) => Some(a.max(b)),
-            (a, b) => a.or(b.map(|(_, t)| t)),
-        }
-    }
+/// Why a reservation was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denied {
+    /// Inside the cooldown; retry after this long.
+    Cooldown(Duration),
+    /// Another agent capture is in flight. Its outcome decides the cooldown, so the
+    /// honest answer is "ask again in a moment", not a full interval.
+    Pending,
 }
 
 pub struct Reservation<'a> {
@@ -38,7 +39,7 @@ impl Reservation<'_> {
     /// Record the shot; the cooldown starts at `at`.
     pub fn commit(mut self, at: Instant) {
         let mut s = self.throttle.lock();
-        if s.pending.is_some_and(|(id, _)| id == self.id) {
+        if s.pending == Some(self.id) {
             s.pending = None;
         }
         s.last_shot = Some(s.last_shot.map_or(at, |t| t.max(at)));
@@ -52,7 +53,7 @@ impl Drop for Reservation<'_> {
             return;
         }
         let mut s = self.throttle.lock();
-        if s.pending.is_some_and(|(id, _)| id == self.id) {
+        if s.pending == Some(self.id) {
             s.pending = None;
         }
     }
@@ -83,15 +84,17 @@ impl Throttle {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Ok(reservation) if a shot may start now, Err(wait) with the remaining cooldown otherwise.
-    pub fn try_reserve(&self, now: Instant) -> Result<Reservation<'_>, Duration> {
+    pub fn try_reserve(&self, now: Instant) -> Result<Reservation<'_>, Denied> {
         let mut s = self.lock();
-        if let Some(wait) = remaining(s.busy_since(), self.min_interval, now) {
-            return Err(wait);
+        if s.pending.is_some() {
+            return Err(Denied::Pending);
+        }
+        if let Some(wait) = remaining(s.last_shot, self.min_interval, now) {
+            return Err(Denied::Cooldown(wait));
         }
         let id = s.next_id;
         s.next_id = s.next_id.wrapping_add(1);
-        s.pending = Some((id, now));
+        s.pending = Some(id);
         Ok(Reservation {
             throttle: self,
             id,
@@ -102,8 +105,7 @@ impl Throttle {
     pub fn status(&self, now: Instant) -> ThrottleStatus {
         let s = self.lock();
         ThrottleStatus {
-            cooldown_remaining: remaining(s.busy_since(), self.min_interval, now)
-                .unwrap_or_default(),
+            cooldown_remaining: remaining(s.last_shot, self.min_interval, now).unwrap_or_default(),
             last_shot_age: s.last_shot.map(|t| now.saturating_duration_since(t)),
         }
     }
@@ -136,8 +138,8 @@ mod tests {
         let t = Throttle::new(IVL);
         let t0 = Instant::now();
         t.try_reserve(t0).unwrap().commit(t0);
-        let wait = t.try_reserve(t0 + Duration::from_secs(30)).err().unwrap();
-        assert_eq!(wait, Duration::from_secs(90));
+        let denied = t.try_reserve(t0 + Duration::from_secs(30)).err();
+        assert_eq!(denied, Some(Denied::Cooldown(Duration::from_secs(90))));
         assert!(t.try_reserve(t0 + IVL).is_ok());
     }
 
@@ -145,9 +147,18 @@ mod tests {
     fn pending_reservation_blocks_a_concurrent_request() {
         let t = Throttle::new(IVL);
         let t0 = Instant::now();
-        let held = t.try_reserve(t0).unwrap();
-        assert!(t.try_reserve(t0 + Duration::from_millis(5)).is_err());
-        drop(held);
+        let _held = t.try_reserve(t0).unwrap();
+        assert_eq!(t.try_reserve(t0).err(), Some(Denied::Pending));
+    }
+
+    #[test]
+    fn pending_blocks_even_when_capture_outlasts_the_interval() {
+        let t = Throttle::new(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let _held = t.try_reserve(t0).unwrap();
+        let much_later = t0 + Duration::from_secs(60);
+        assert_eq!(t.try_reserve(much_later).err(), Some(Denied::Pending));
+        assert_eq!(t.status(much_later).cooldown_remaining, Duration::ZERO);
     }
 
     #[test]
@@ -185,13 +196,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_interval_never_throttles() {
+    fn zero_interval_still_serialises_but_never_cools_down() {
         let t = Throttle::new(Duration::ZERO);
         let now = Instant::now();
         let a = t.try_reserve(now).unwrap();
-        let b = t.try_reserve(now).unwrap();
+        assert_eq!(t.try_reserve(now).err(), Some(Denied::Pending));
         a.commit(now);
-        b.commit(now);
+        assert!(t.try_reserve(now).is_ok());
     }
 
     #[test]
