@@ -108,17 +108,18 @@ token is checked. Every response carries `Cache-Control: no-store`.
 | `400` | Bad `width` or `quality`; the body says which |
 | `401` | Missing or wrong token |
 | `429` | Inside the cooldown. `Retry-After: N` and the body `throttled, retry in Ns` carry the same N |
-| `503` + `Retry-After: 1` | Camera busy with another capture |
+| `503` + `Retry-After: 1` | Camera busy: another capture, including another agent snapshot, is in flight |
 | `503` + `Retry-After: 2` | Transient failure, including another app holding the camera |
 | `503`, no `Retry-After` | Camera unavailable (no device, permission denied). The body starts with `camera unavailable:` and needs a human to fix |
 
 A `503` never uses up the cooldown. When several agent requests arrive at
-once, only one gets through the cooldown.
+once, only one captures. The others get `503 camera busy` while it is in
+flight, and `429` once it has succeeded.
 
 `/status` example:
 
 ```json
-{"version":"0.1.1","min_interval_s":120,"cooldown_remaining_s":0,"last_shot_age_s":null,"camera":"closed","camera_error":null}
+{"version":"0.2.0","min_interval_s":120,"cooldown_remaining_s":0,"last_shot_age_s":null,"camera":"closed","camera_error":null}
 ```
 
 `camera` is `closed`, `opening`, `streaming`, or `failed`. `camera_error` is
@@ -148,13 +149,13 @@ when the next attempt is due.
   give it only to your agent. Prefer the `Authorization` header over
   `?token=`, which ends up in shell history and logs.
 - The preview token is separate so the agent token has no way around the
-  cooldown. Earlier builds let an agent add `align=1` to `/snapshot` to skip
+  cooldown. Before 0.2.0, an agent could add `align=1` to `/snapshot` to skip
   it; that parameter is now ignored. The preview token can still fetch
   960 px frames with no cooldown, so keep it as private as the agent token.
 - Both tokens are 32 hex chars from `/dev/urandom`, live only in process
   memory, and expire when the process exits.
 - Every request is logged live to the terminal as `GRANT`, `DENY`,
-  `THROTTLED`, `BAD REQ`, `ERROR`, `STATUS`, or `PREVIEW`. Successful
+  `THROTTLED`, `BUSY`, `BAD REQ`, `ERROR`, `STATUS`, or `PREVIEW`. Successful
   `/preview/frame` requests are not logged.
 
 ## Development

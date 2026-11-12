@@ -46,7 +46,7 @@ curl -s -H "Authorization: Bearer $PASSFOTO_TOKEN" "$PASSFOTO_URL/status"
 ```
 
 ```json
-{"version":"0.1.1","min_interval_s":120,"cooldown_remaining_s":0,"last_shot_age_s":null,"camera":"closed","camera_error":null}
+{"version":"0.2.0","min_interval_s":120,"cooldown_remaining_s":0,"last_shot_age_s":null,"camera":"closed","camera_error":null}
 ```
 
 `camera` is one of `closed`, `opening`, `streaming`, or `failed`. `closed` is
@@ -122,4 +122,4 @@ curl -sS -H "Authorization: Bearer $PASSFOTO_TOKEN" -o shot.jpg -D headers.txt \
 - `align=1` on `/snapshot` is ignored. Agent snapshots are always rate
   limited.
 - Every request is logged in the human's terminal as `GRANT`, `DENY`,
-  `THROTTLED`, `BAD REQ`, `ERROR`, `STATUS`, or `PREVIEW`.
+  `THROTTLED`, `BUSY`, `BAD REQ`, `ERROR`, `STATUS`, or `PREVIEW`.
