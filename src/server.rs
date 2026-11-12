@@ -250,18 +250,20 @@ fn camera_summary(state: &CameraState) -> CameraSummary<'_> {
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
 fn capture_failed(e: &CaptureError) -> Resp {
-    // Retry-After only where retrying can help; Unavailable needs the human.
-    match e {
-        CaptureError::Busy => {
-            with_header(text(503, "camera busy, try again\n"), "Retry-After", "1")
-        }
-        CaptureError::Transient(_) => with_header(
-            text(503, "camera capture failed, try again\n"),
-            "Retry-After",
-            "2",
-        ),
-        CaptureError::Unavailable(why) => text(503, &format!("camera unavailable: {why}\n")),
-    }
+    // Unavailable (no device, no permission) needs the human, so it gets no
+    // Retry-After: that absence is how a client tells "wait" from "ask for help".
+    let what = match e {
+        CaptureError::Busy => "camera busy",
+        CaptureError::Transient { .. } => "camera capture failed",
+        CaptureError::Unavailable { .. } => return text(503, &format!("{e}\n")),
+    };
+    // Never 0: a client told to retry immediately would spin.
+    let secs = ceil_secs(e.retry_after()).max(1);
+    with_header(
+        text(503, &format!("{what}, retry in {secs}s\n")),
+        "Retry-After",
+        &secs.to_string(),
+    )
 }
 
 fn jpeg(frame: Frame) -> Resp {
@@ -338,16 +340,32 @@ mod tests {
         assert_eq!(Route::from_path("/favicon.ico"), None);
     }
 
+    fn retry_after_header(e: CaptureError) -> Option<String> {
+        capture_failed(&e)
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Retry-After"))
+            .map(|h| h.value.to_string())
+    }
+
     #[test]
-    fn retry_after_only_when_retrying_helps() {
-        let has_retry = |e: CaptureError| {
-            capture_failed(&e)
-                .headers()
-                .iter()
-                .any(|h| h.field.equiv("Retry-After"))
+    fn retry_after_tracks_camera_backoff() {
+        let transient = |ms| CaptureError::Transient {
+            reason: "x".into(),
+            retry_after: Duration::from_millis(ms),
         };
-        assert!(has_retry(CaptureError::Busy));
-        assert!(has_retry(CaptureError::Transient("x".into())));
-        assert!(!has_retry(CaptureError::Unavailable("x".into())));
+        assert_eq!(retry_after_header(CaptureError::Busy).as_deref(), Some("1"));
+        assert_eq!(retry_after_header(transient(4_000)).as_deref(), Some("4"));
+        assert_eq!(retry_after_header(transient(3_200)).as_deref(), Some("4"));
+        assert_eq!(retry_after_header(transient(0)).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn unavailable_has_no_retry_after() {
+        let e = CaptureError::Unavailable {
+            reason: "x".into(),
+            retry_after: Duration::from_secs(8),
+        };
+        assert_eq!(retry_after_header(e), None);
     }
 }
